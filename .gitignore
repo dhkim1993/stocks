@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.spec
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# 환경변수 (실제 값이 담긴 파일)
+.env
+
+# 상태 파일 (런타임 생성)
+ark_state.json
+sent_items.json
+
+# 로그
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
