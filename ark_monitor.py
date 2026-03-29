@@ -196,6 +196,78 @@ def save_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 매매 변경사항 계산 (diff)
+# ---------------------------------------------------------------------------
+def _to_shares(val) -> float:
+    try:
+        return float(str(val).replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_weight(val) -> float:
+    try:
+        return float(str(val).replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def compute_diff(prev: list[dict], curr: list[dict]) -> dict:
+    """이전/현재 보유 목록을 비교해 매수·매도·증감 내역 반환."""
+    prev_map = {str(r.get("ticker", "")).strip(): r for r in prev if r.get("ticker")}
+    curr_map = {str(r.get("ticker", "")).strip(): r for r in curr if r.get("ticker")}
+
+    prev_tickers = set(prev_map)
+    curr_tickers = set(curr_map)
+
+    bought, sold, increased, decreased = [], [], [], []
+
+    for ticker in sorted(curr_tickers - prev_tickers):
+        row = curr_map[ticker]
+        bought.append({
+            "ticker": ticker,
+            "company": row.get("company", ""),
+            "shares": row.get("shares"),
+            "weight": row.get("weight"),
+            "market_value": row.get("market value ($)"),
+        })
+
+    for ticker in sorted(prev_tickers - curr_tickers):
+        row = prev_map[ticker]
+        sold.append({
+            "ticker": ticker,
+            "company": row.get("company", ""),
+            "shares": row.get("shares"),
+            "weight": row.get("weight"),
+        })
+
+    for ticker in sorted(curr_tickers & prev_tickers):
+        prev_shares = _to_shares(prev_map[ticker].get("shares"))
+        curr_shares = _to_shares(curr_map[ticker].get("shares"))
+        diff_shares = curr_shares - prev_shares
+        if diff_shares == 0:
+            continue
+        prev_weight = _to_weight(prev_map[ticker].get("weight"))
+        curr_weight = _to_weight(curr_map[ticker].get("weight"))
+        item = {
+            "ticker": ticker,
+            "company": curr_map[ticker].get("company", ""),
+            "prev_shares": prev_shares,
+            "curr_shares": curr_shares,
+            "diff_shares": diff_shares,
+            "prev_weight": prev_weight,
+            "curr_weight": curr_weight,
+            "diff_weight": curr_weight - prev_weight,
+        }
+        if diff_shares > 0:
+            increased.append(item)
+        else:
+            decreased.append(item)
+
+    return {"bought": bought, "sold": sold, "increased": increased, "decreased": decreased}
+
+
+# ---------------------------------------------------------------------------
 # 텔레그램 전송
 # ---------------------------------------------------------------------------
 def send_telegram(message: str) -> None:
@@ -244,12 +316,94 @@ def _safe(val, fmt: str = "") -> str:
     return s
 
 
-def format_portfolio_message(fund_name: str, holdings: list[dict], is_first_run: bool = False) -> str:
+def format_diff_message(fund_name: str, diff: dict) -> str:
+    """매수·매도·증감 변경 내역 메시지."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    status_label = "초기 등록" if is_first_run else "변경 감지"
+    bought = diff["bought"]
+    sold = diff["sold"]
+    increased = diff["increased"]
+    decreased = diff["decreased"]
+
+    total_changes = len(bought) + len(sold) + len(increased) + len(decreased)
+    if total_changes == 0:
+        return ""
 
     lines = [
-        f"<b>📊 ARK {fund_name} 포트폴리오 {status_label}</b>",
+        f"<b>🔔 ARK {fund_name} 매매 변경 감지</b>",
+        f"🕐 {now}",
+        "",
+    ]
+
+    if bought:
+        lines.append(f"<b>🟢 신규 매수 ({len(bought)}종목)</b>")
+        for r in bought:
+            w = _safe(r.get("weight"), "float")
+            sh = _safe(r.get("shares"), "int")
+            mv = _safe(r.get("market_value"), "float")
+            detail_parts = []
+            if w != "N/A":
+                detail_parts.append(f"비중 {w}%")
+            if mv != "N/A":
+                detail_parts.append(f"${mv}")
+            if sh != "N/A":
+                detail_parts.append(f"{sh}주")
+            detail = "  |  ".join(detail_parts)
+            lines.append(f"  ▶ <b>{r['ticker']}</b>  {r.get('company','')}")
+            if detail:
+                lines.append(f"      {detail}")
+        lines.append("")
+
+    if sold:
+        lines.append(f"<b>🔴 전량 매도 ({len(sold)}종목)</b>")
+        for r in sold:
+            sh = _safe(r.get("shares"), "int")
+            w = _safe(r.get("weight"), "float")
+            detail_parts = []
+            if w != "N/A":
+                detail_parts.append(f"이전 비중 {w}%")
+            if sh != "N/A":
+                detail_parts.append(f"이전 {sh}주")
+            detail = "  |  ".join(detail_parts)
+            lines.append(f"  ▶ <b>{r['ticker']}</b>  {r.get('company','')}")
+            if detail:
+                lines.append(f"      {detail}")
+        lines.append("")
+
+    if increased:
+        lines.append(f"<b>📈 추가 매수 ({len(increased)}종목)</b>")
+        for r in increased:
+            diff_sh = int(r["diff_shares"])
+            diff_w = r["diff_weight"]
+            w_sign = "+" if diff_w >= 0 else ""
+            lines.append(
+                f"  ▶ <b>{r['ticker']}</b>  {r.get('company','')}"
+                f"\n      +{diff_sh:,}주  ({w_sign}{diff_w:.2f}%p)"
+                f"  →  {int(r['curr_shares']):,}주 / 비중 {r['curr_weight']:.2f}%"
+            )
+        lines.append("")
+
+    if decreased:
+        lines.append(f"<b>📉 일부 매도 ({len(decreased)}종목)</b>")
+        for r in decreased:
+            diff_sh = int(r["diff_shares"])  # 음수
+            diff_w = r["diff_weight"]
+            w_sign = "+" if diff_w >= 0 else ""
+            lines.append(
+                f"  ▶ <b>{r['ticker']}</b>  {r.get('company','')}"
+                f"\n      {diff_sh:,}주  ({w_sign}{diff_w:.2f}%p)"
+                f"  →  {int(r['curr_shares']):,}주 / 비중 {r['curr_weight']:.2f}%"
+            )
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+def format_portfolio_message(fund_name: str, holdings: list[dict], is_first_run: bool = False) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status_label = "초기 등록" if is_first_run else "전체 포트폴리오"
+
+    lines = [
+        f"<b>📊 ARK {fund_name} {status_label}</b>",
         f"🕐 {now}",
         f"📋 총 {len(holdings)}개 종목",
         "─" * 30,
@@ -308,16 +462,29 @@ def check_and_notify() -> None:
         if current_hash != previous_hash:
             if is_first_run:
                 logger.info(f"[{fund_name}] 초기 포트폴리오 등록")
+                send_telegram(format_portfolio_message(fund_name, holdings, is_first_run=True))
             else:
-                logger.info(f"[{fund_name}] ★ 변경사항 감지 → 텔레그램 전송")
+                prev_holdings = fund_state.get("holdings", [])
+                diff = compute_diff(prev_holdings, holdings)
+                total_changes = sum(len(diff[k]) for k in diff)
+                logger.info(
+                    f"[{fund_name}] ★ 변경 감지 — "
+                    f"신규매수 {len(diff['bought'])} / 전량매도 {len(diff['sold'])} / "
+                    f"추가매수 {len(diff['increased'])} / 일부매도 {len(diff['decreased'])}"
+                )
 
-            msg = format_portfolio_message(fund_name, holdings, is_first_run=is_first_run)
-            send_telegram(msg)
+                if total_changes > 0:
+                    diff_msg = format_diff_message(fund_name, diff)
+                    if diff_msg:
+                        send_telegram(diff_msg)
+
+                send_telegram(format_portfolio_message(fund_name, holdings, is_first_run=False))
 
             state[fund_name] = {
                 "hash": current_hash,
                 "last_updated": datetime.now().isoformat(),
                 "holdings_count": len(holdings),
+                "holdings": holdings,
             }
             state_updated = True
         else:
