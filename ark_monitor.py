@@ -1,6 +1,7 @@
 """
 ARK 펀드 포트폴리오 모니터링 배치
-- 1분 간격으로 ARK ETF 보유 종목 CSV를 크롤링
+- 1분 간격으로 ARK ETF 보유 종목 조회 (기본: arkfunds.io JSON API)
+- 공식 ark-funds.com CSV는 URL/파일명 변경으로 404가 잦아 API를 우선 사용
 - 이전 데이터와 변경사항 감지 시 텔레그램으로 포트폴리오 전송
 """
 
@@ -20,20 +21,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# ARK ETF 목록 및 CSV URL
+# ARK ETF 심볼 및 (선택) 공식 CSV URL — CSV는 펀드별 404 가능, 폴백용
 # ---------------------------------------------------------------------------
-ARK_FUNDS = {
-    "ARKK": "https://ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_INNOVATION_ETF_ARKK_HOLDINGS.csv",
-    "ARKQ": "https://ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_AUTONOMOUS_TECHNOLOGY_&_ROBOTICS_ETF_ARKQ_HOLDINGS.csv",
-    "ARKW": "https://ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_NEXT_GENERATION_INTERNET_ETF_ARKW_HOLDINGS.csv",
-    "ARKG": "https://ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_GENOMIC_REVOLUTION_MULTISECTOR_ETF_ARKG_HOLDINGS.csv",
-    "ARKF": "https://ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_FINTECH_INNOVATION_ETF_ARKF_HOLDINGS.csv",
-    "ARKX": "https://ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_SPACE_EXPLORATION_&_INNOVATION_ETF_ARKX_HOLDINGS.csv",
+ARK_SYMBOLS = ("ARKK", "ARKQ", "ARKW", "ARKG", "ARKF", "ARKX")
+
+ARK_CSV_FALLBACK = {
+    "ARKK": "https://www.ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_INNOVATION_ETF_ARKK_HOLDINGS.csv",
+    "ARKQ": "https://www.ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_AUTONOMOUS_TECHNOLOGY_&_ROBOTICS_ETF_ARKQ_HOLDINGS.csv",
+    "ARKW": "https://www.ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_NEXT_GENERATION_INTERNET_ETF_ARKW_HOLDINGS.csv",
+    "ARKG": "https://www.ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_GENOMIC_REVOLUTION_MULTISECTOR_ETF_ARKG_HOLDINGS.csv",
+    "ARKF": "https://www.ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_FINTECH_INNOVATION_ETF_ARKF_HOLDINGS.csv",
+    "ARKX": "https://www.ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_SPACE_EXPLORATION_%26_INNOVATION_ETF_ARKX_HOLDINGS.csv",
 }
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 STATE_FILE = os.getenv("ARK_STATE_FILE", "ark_state.json")
+
+# api | csv | api_then_csv
+ARK_DATA_SOURCE = os.getenv("ARK_DATA_SOURCE", "api_then_csv").strip().lower()
+ARK_HOLDINGS_API_URL = os.getenv(
+    "ARK_HOLDINGS_API_URL", "https://arkfunds.io/api/v2/etf/holdings"
+).rstrip("/")
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -41,7 +50,7 @@ REQUEST_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/csv,text/plain,*/*",
+    "Accept": "application/json,text/csv,text/plain,*/*",
 }
 
 logging.basicConfig(
@@ -55,20 +64,66 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 데이터 수집
 # ---------------------------------------------------------------------------
-def fetch_ark_holdings(fund_name: str, url: str) -> list[dict] | None:
-    """ARK ETF 보유 종목 CSV를 가져와서 레코드 목록으로 반환."""
+def _normalize_api_holding(row: dict) -> dict:
+    """API 응답을 포맷터가 기대하는 키 형태로 맞춤."""
+    return {
+        "ticker": str(row.get("ticker") or "").strip(),
+        "company": row.get("company") or "",
+        "weight": row.get("weight"),
+        "shares": row.get("shares"),
+        "market value ($)": row.get("market_value"),
+    }
+
+
+def fetch_ark_holdings_api(fund_name: str) -> list[dict] | None:
+    """arkfunds.io 스타일 holdings JSON API (ARK Invest 비공식 커뮤니티 API)."""
+    try:
+        resp = requests.get(
+            ARK_HOLDINGS_API_URL,
+            params={"symbol": fund_name},
+            headers=REQUEST_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except requests.RequestException as e:
+        logger.error(f"[{fund_name}] API HTTP 실패: {e}")
+        return None
+    except ValueError as e:
+        logger.error(f"[{fund_name}] API JSON 파싱 실패: {e}")
+        return None
+
+    raw = payload.get("holdings") or []
+    if not raw:
+        logger.warning(f"[{fund_name}] API 응답에 holdings 없음")
+        return None
+
+    sorted_rows = sorted(
+        raw,
+        key=lambda x: (x.get("weight_rank") if x.get("weight_rank") is not None else 9999, str(x.get("ticker") or "")),
+    )
+    records = [_normalize_api_holding(h) for h in sorted_rows]
+    records = [r for r in records if r["ticker"]]
+    logger.info(f"[{fund_name}] API로 {len(records)}개 종목 수집")
+    return records
+
+
+def fetch_ark_holdings_csv(fund_name: str, url: str) -> list[dict] | None:
+    """ARK 공식 사이트 CSV (경로 변경 시 404 가능)."""
     try:
         resp = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
         resp.raise_for_status()
     except requests.RequestException as e:
-        logger.error(f"[{fund_name}] HTTP 요청 실패: {e}")
+        logger.error(f"[{fund_name}] CSV HTTP 실패: {e}")
         return None
 
     try:
         content = resp.text
-        lines = content.splitlines()
+        if content.lstrip().startswith("<!DOCTYPE") or content.lstrip().startswith("<html"):
+            logger.error(f"[{fund_name}] CSV URL이 HTML(404 페이지)을 반환함")
+            return None
 
-        # CSV 헤더 행 탐색 (date / fund 컬럼이 있는 첫 번째 행)
+        lines = content.splitlines()
         header_idx = 0
         for i, line in enumerate(lines):
             if "date" in line.lower() or "fund" in line.lower():
@@ -80,16 +135,38 @@ def fetch_ark_holdings(fund_name: str, url: str) -> list[dict] | None:
         df.columns = [str(c).strip().lower() for c in df.columns]
         df = df.dropna(how="all")
 
-        # 빈 ticker 행(합계 행 등) 제거
         if "ticker" in df.columns:
             df = df[df["ticker"].notna() & (df["ticker"].astype(str).str.strip() != "")]
 
         records = df.to_dict("records")
-        logger.info(f"[{fund_name}] {len(records)}개 종목 수집 완료")
+        logger.info(f"[{fund_name}] CSV로 {len(records)}개 종목 수집")
         return records
     except Exception as e:
         logger.error(f"[{fund_name}] CSV 파싱 실패: {e}")
         return None
+
+
+def fetch_ark_holdings(fund_name: str) -> list[dict] | None:
+    """ARK_DATA_SOURCE 에 따라 API / CSV / 순차 폴백."""
+    src = ARK_DATA_SOURCE
+    url = ARK_CSV_FALLBACK.get(fund_name, "")
+
+    if src == "csv":
+        if not url:
+            return None
+        return fetch_ark_holdings_csv(fund_name, url)
+
+    if src == "api":
+        return fetch_ark_holdings_api(fund_name)
+
+    # api_then_csv (기본): API가 비어 있거나 실패하면 CSV 시도
+    api_rows = fetch_ark_holdings_api(fund_name)
+    if api_rows:
+        return api_rows
+    if url:
+        logger.warning(f"[{fund_name}] API 없음/실패 → CSV 폴백 시도")
+        return fetch_ark_holdings_csv(fund_name, url)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +261,11 @@ def format_portfolio_message(fund_name: str, holdings: list[dict], is_first_run:
         company = _safe(row.get("company") or row.get("name"))
         weight_raw = row.get("weight (%)") or row.get("weight(%)") or row.get("weight")
         shares_raw = row.get("shares")
-        mv_raw = row.get("market value ($)") or row.get("market value")
+        mv_raw = (
+            row.get("market value ($)")
+            or row.get("market value")
+            or row.get("market_value")
+        )
 
         weight = _safe(weight_raw, "float")
         shares = _safe(shares_raw, "int")
@@ -214,8 +295,8 @@ def check_and_notify() -> None:
     state = load_state()
     state_updated = False
 
-    for fund_name, url in ARK_FUNDS.items():
-        holdings = fetch_ark_holdings(fund_name, url)
+    for fund_name in ARK_SYMBOLS:
+        holdings = fetch_ark_holdings(fund_name)
         if holdings is None:
             continue
 
