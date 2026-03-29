@@ -1,0 +1,64 @@
+name: ARK 펀드 포트폴리오 모니터링
+
+on:
+  # GitHub Actions 최소 cron 간격은 5분
+  # 각 실행마다 내부적으로 1분 간격 x 5회 루프 → 실질적 1분 단위 모니터링
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      loop_minutes:
+        description: "루프 실행 시간(분)"
+        required: false
+        default: "5"
+
+jobs:
+  monitor:
+    name: ARK Portfolio Monitor
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 캐시 복원
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      # ARK 포트폴리오 상태 파일을 실행 간에 유지하기 위해 캐시 사용
+      - name: 포트폴리오 상태 캐시 복원
+        uses: actions/cache@v4
+        id: ark-state-cache
+        with:
+          path: ark_state.json
+          key: ark-state-${{ github.run_id }}
+          restore-keys: |
+            ark-state-
+
+      - name: ARK 펀드 포트폴리오 모니터링 실행
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ARK_STATE_FILE: ark_state.json
+        run: |
+          LOOP_MINUTES="${{ github.event.inputs.loop_minutes || '5' }}"
+          python ark_monitor.py --mode loop --loop-minutes "$LOOP_MINUTES" --interval 1
+
+      - name: 포트폴리오 상태 캐시 저장
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ark_state.json
+          key: ark-state-${{ github.run_id }}
