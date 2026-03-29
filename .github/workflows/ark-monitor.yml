@@ -16,6 +16,9 @@ jobs:
   monitor:
     name: ARK Portfolio Monitor
     runs-on: ubuntu-latest
+    permissions:
+      actions: read   # 이전 실행 artifact 다운로드용
+      contents: read
 
     steps:
       - name: 코드 체크아웃
@@ -26,7 +29,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 의존성 캐시 복원
+      - name: 의존성 캐시
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -37,15 +40,25 @@ jobs:
       - name: 패키지 설치
         run: pip install -r requirements.txt
 
-      # ARK 포트폴리오 상태 파일을 실행 간에 유지하기 위해 캐시 사용
-      - name: 포트폴리오 상태 캐시 복원
-        uses: actions/cache@v4
-        id: ark-state-cache
-        with:
-          path: ark_state.json
-          key: ark-state-${{ github.run_id }}
-          restore-keys: |
-            ark-state-
+      # 이전 실행에서 저장한 ark_state.json 을 내려받아 변경 감지에 사용
+      - name: 이전 포트폴리오 상태 복원
+        run: |
+          PREV_RUN=$(gh run list \
+            --workflow=ark-monitor.yml \
+            --status=success \
+            --limit=1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')
+          if [ -n "$PREV_RUN" ]; then
+            gh run download "$PREV_RUN" --name ark-state --dir . \
+              && echo "상태 파일 복원 완료 (run: $PREV_RUN)" \
+              || echo "아티팩트 없음 — 첫 실행으로 처리"
+          else
+            echo "이전 성공 실행 없음 — 첫 실행으로 처리"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
 
       - name: ARK 펀드 포트폴리오 모니터링 실행
         env:
@@ -56,9 +69,12 @@ jobs:
           LOOP_MINUTES="${{ github.event.inputs.loop_minutes || '5' }}"
           python ark_monitor.py --mode loop --loop-minutes "$LOOP_MINUTES" --interval 1
 
-      - name: 포트폴리오 상태 캐시 저장
-        uses: actions/cache/save@v4
+      # 실행 후 상태 파일을 artifact로 저장 → 다음 실행에서 복원
+      - name: 포트폴리오 상태 저장
+        uses: actions/upload-artifact@v4
         if: always()
         with:
+          name: ark-state
           path: ark_state.json
-          key: ark-state-${{ github.run_id }}
+          retention-days: 7
+          overwrite: true
