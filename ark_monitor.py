@@ -25,6 +25,15 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 ARK_SYMBOLS = ("ARKK", "ARKQ", "ARKW", "ARKG", "ARKF", "ARKX")
 
+ARK_DESC = {
+    "ARKK": "혁신 기술 종합 (AI · 로보틱스 · 핀테크 · 바이오)",
+    "ARKQ": "자율주행 + 로보틱스 + 우주",
+    "ARKW": "차세대 인터넷 + 클라우드 + 핀테크",
+    "ARKG": "바이오 + 유전체 혁명",
+    "ARKF": "핀테크 + 디지털 결제",
+    "ARKX": "우주 + 방위 + 항공",
+}
+
 ARK_CSV_FALLBACK = {
     "ARKK": "https://www.ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_INNOVATION_ETF_ARKK_HOLDINGS.csv",
     "ARKQ": "https://www.ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_AUTONOMOUS_TECHNOLOGY_&_ROBOTICS_ETF_ARKQ_HOLDINGS.csv",
@@ -328,11 +337,15 @@ def format_diff_message(fund_name: str, diff: dict) -> str:
     if total_changes == 0:
         return ""
 
+    desc = ARK_DESC.get(fund_name, "")
     lines = [
         f"<b>🔔 ARK {fund_name} 매매 변경 감지</b>",
+        f"📌 {desc}" if desc else "",
         f"🕐 {now}",
         "",
     ]
+    lines = [l for l in lines if l != ""]
+    lines.append("")
 
     if bought:
         lines.append(f"<b>🟢 신규 매수 ({len(bought)}종목)</b>")
@@ -402,13 +415,16 @@ def format_portfolio_message(fund_name: str, holdings: list[dict], is_first_run:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     status_label = "초기 등록" if is_first_run else "전체 포트폴리오"
 
+    desc = ARK_DESC.get(fund_name, "")
     lines = [
         f"<b>📊 ARK {fund_name} {status_label}</b>",
+        f"📌 {desc}" if desc else "",
         f"🕐 {now}",
         f"📋 총 {len(holdings)}개 종목",
         "─" * 30,
         "",
     ]
+    lines = [l for l in lines if l != ""]
 
     for i, row in enumerate(holdings, 1):
         ticker = _safe(row.get("ticker") or row.get("symbol"))
